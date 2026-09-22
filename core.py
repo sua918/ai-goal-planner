@@ -1,7 +1,7 @@
-"""자연어 해석 → 일정 초안 → 검증 → 한 번의 수정으로 이어지는 핵심 로직.
+"""자연어 해석 → 일정 초안 → 검증 → 한 번의 수정으로 이어지는 핵심 로직입니다.
 
-LLM은 배치를 판단하고, Python은 시간 계산과 명시된 제약을 검사한다.
-이 모듈은 Streamlit 없이도 사용할 수 있다.
+LLM은 배치를 판단하고, Python은 시간 계산과 명시된 제약을 검사합니다.
+이 모듈은 Streamlit 없이도 사용할 수 있습니다.
 """
 
 # %% imports
@@ -18,7 +18,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, Field
 
-# 배포 환경에 주입된 값은 유지하고, 로컬에서는 현재 폴더의 .env를 읽는다.
+# 배포 환경에 주입된 값은 유지하고, 로컬에서는 현재 폴더의 .env를 읽습니다.
 load_dotenv(".env")
 
 Recurrence = Literal["daily", "weekdays", "weekends", "flexible", "once"]
@@ -33,11 +33,9 @@ MODEL_DEFAULTS = {
     "openai": ("gpt-4.1-mini", "OPENAI_API_KEY"),
 }
 
-
 # %% input_models
-
 class CalendarEvent(BaseModel):
-    """화면과 내보내기에 사용하는 일정. fixed는 원래 일정, generated는 AI 배치다."""
+    """화면과 내보내기에 사용하는 일정입니다. fixed는 원래 일정이고 generated는 AI 배치입니다."""
 
     title: str
     start: datetime
@@ -47,7 +45,7 @@ class CalendarEvent(BaseModel):
     reason: str | None = None
 
 class ParsedGoal(BaseModel):
-    """목표의 시간·마감 조건. 명시되지 않은 값은 None으로 남긴다."""
+    """목표의 시간·마감 조건입니다. 명시되지 않은 값은 None으로 남깁니다."""
 
     title: str
     deadline: date | None = None
@@ -56,11 +54,14 @@ class ParsedGoal(BaseModel):
     recurrence: Recurrence = "flexible"
     session_minutes: int | None = Field(default=None, ge=1)
     target_sessions_per_week: int | None = Field(default=None, ge=1, le=14)
-    required_minutes: int | None = Field(default=None, ge=1)
+    required_minutes: int | None = Field(
+        default=None, ge=1,
+        description="사용자가 전체 계획 기간의 총 필요 시간을 직접 명시한 경우에만 저장합니다. 회당 시간이나 주당 횟수로 계산한 값은 넣지 않습니다.",
+    )
     constraints: list[str] = Field(default_factory=list)
 
 class FixedSchedule(BaseModel):
-    """반복 규칙을 가진 고정 일정. once일 때 event_date를 사용한다."""
+    """반복 규칙을 가진 고정 일정입니다. once일 때 event_date를 사용합니다."""
 
     title: str
     recurrence: FixedRecurrence
@@ -69,7 +70,7 @@ class FixedSchedule(BaseModel):
     event_date: date | None = None
 
 class LifestylePreferences(BaseModel):
-    """사용자가 직접 말한 활동·식사·취침 시간만 저장한다."""
+    """사용자가 직접 말한 활동·식사·취침 시간만 저장합니다."""
 
     active_start: str | None = Field(default=None, pattern=TIME_PATTERN)
     active_end: str | None = Field(default=None, pattern=TIME_PATTERN)
@@ -80,7 +81,7 @@ class LifestylePreferences(BaseModel):
     wind_down_start: str | None = Field(default=None, pattern=TIME_PATTERN)
 
 class AvailabilityRule(BaseModel):
-    """가능 시간과 하루 한도는 검증하고, preference는 LLM 판단에 맡긴다."""
+    """가능 시간과 하루 한도는 검증하고, preference는 LLM 판단에 맡깁니다."""
 
     recurrence: Literal["daily", "weekdays", "weekends"]
     start_time: str | None = Field(default=None, pattern=TIME_PATTERN)
@@ -89,7 +90,7 @@ class AvailabilityRule(BaseModel):
     preference: Literal["preferred", "normal", "avoid"] = "normal"
 
 class PlanSpec(BaseModel):
-    """Interpretation 체인이 반환하는 목표와 제약의 묶음."""
+    """Interpretation 체인이 반환하는 목표와 제약의 묶음입니다."""
 
     plan_start: date
     plan_end: date
@@ -101,9 +102,8 @@ class PlanSpec(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 # %% output_models
-
 class PlannedEvent(BaseModel):
-    """Planner가 제안한 학습·작업 한 건. 아직 검증되지 않은 초안이다."""
+    """Planner가 제안한 학습·작업 한 건입니다. 아직 검증되지 않은 초안입니다."""
 
     title: str
     date: date
@@ -113,27 +113,27 @@ class PlannedEvent(BaseModel):
     reason: str | None = None
 
 class DraftSchedule(BaseModel):
-    """Planner와 Repair가 공유하는 구조화된 출력 형식."""
+    """Planner와 Repair가 공유하는 구조화된 출력 형식입니다."""
 
     events: list[PlannedEvent]
     strategy_summary: str = Field(description="2~4개의 짧은 핵심 문장으로 작성한 계획 전략")
     warnings: list[str] = Field(default_factory=list)
 
 class ValidationIssue(BaseModel):
-    """event_index로 문제 일정을 가리킨다. 누락처럼 일정이 없으면 None이다."""
+    """event_index로 문제 일정을 가리킵니다. 누락처럼 일정이 없으면 None입니다."""
 
     code: str
     message: str
     event_index: int | None = None
 
 class ValidationResult(BaseModel):
-    """검증 결과를 Repair의 입력으로 전달한다."""
+    """검증 결과를 Repair의 입력으로 전달합니다."""
 
     valid: bool
     issues: list[ValidationIssue] = Field(default_factory=list)
 
 class GoalSummary(BaseModel):
-    """최종 남은 일정의 시간을 합산한 목표별 요약."""
+    """최종 남은 일정의 시간을 합산한 목표별 요약입니다."""
 
     title: str
     priority: Priority
@@ -144,7 +144,7 @@ class GoalSummary(BaseModel):
     shortage_hours: float = Field(default=0, ge=0)
 
 class ScheduleResult(BaseModel):
-    """검증 후 남은 일정과 가정·주의사항을 화면에 전달한다."""
+    """검증 후 남은 일정과 가정·주의사항을 화면에 전달합니다."""
 
     plan_start: date
     plan_end: date
@@ -155,7 +155,7 @@ class ScheduleResult(BaseModel):
     warning: str | None = None
 
 # %% interpret_prompt
-# 역할과 제약은 system, 실행마다 바뀌는 사용자 원문은 human에 둔다.
+# 역할과 제약은 system에, 실행마다 바뀌는 사용자 원문은 human에 둡니다.
 INTERPRET_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -172,8 +172,10 @@ INTERPRET_PROMPT = ChatPromptTemplate.from_messages(
 추출 규칙:
 - 목표마다 deadline, priority, priority_reason, recurrence, session_minutes, target_sessions_per_week, required_minutes, constraints를 추출한다.
 - recurrence는 daily, weekdays, weekends, flexible, once 중 하나다.
-- 사용자가 총 필요 시간을 명시했다면 required_minutes에 반영한다.
-- 총 시간이 없는 목표는 회당 학습 시간이나 주당 횟수에 대한 reasonable hint를 제공할 수 있다. 근거 없이 정밀한 총시간을 지어내지 않는다.
+- required_minutes에는 사용자가 '총 5시간 필요'처럼 전체 계획 기간의 총 필요 시간을 직접 명시한 경우에만 값을 넣는다.
+- '매일 20분', '주 3회'처럼 반복 기준만 있는 경우 required_minutes는 null로 두고 session_minutes와 target_sessions_per_week에만 반영한다.
+- session_minutes × target_sessions_per_week를 required_minutes로 계산하지 않는다.
+- 총 시간이 없는 목표는 회당 학습 시간이나 주당 횟수에 대한 reasonable hint를 제공할 수 있지만 근거 없이 정밀한 전체 총시간을 지어내지 않는다.
 - '매일 30분'은 recurrence='daily', session_minutes=30이다.
 - 고정 일정은 fixed_schedules로 분리하고 24시간제 start_time/end_time을 정확히 적는다.
 - '평일 오전 9시부터 오후 6시 부트캠프'는 weekdays 09:00~18:00이다.
@@ -193,7 +195,7 @@ INTERPRET_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 # %% plan_prompt
-# 원문 대신 PlanSpec과 날짜별 고정 일정을 보내 배치에 필요한 맥락을 좁힌다.
+# 원문 대신 PlanSpec과 날짜별 고정 일정을 보내 배치에 필요한 맥락을 좁힙니다.
 PLAN_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -240,7 +242,7 @@ PlanSpec과 날짜별로 펼쳐진 fixed_events를 보고 generated 일정만 Dr
 )
 
 # %% repair_prompt
-# 기존 초안과 검증 오류를 함께 보내 수정 범위를 제한한다.
+# 기존 초안과 검증 오류를 함께 보내 수정 범위를 제한합니다.
 REPAIR_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -271,7 +273,7 @@ strategy_summary는 수정된 계획을 반영하되 2~4개의 짧은 핵심 문
 
 # %% model_config
 def model_settings() -> tuple[str, str, str]:
-    """provider, 모델명, 키의 환경변수 이름을 반환한다. 키 값은 노출하지 않는다."""
+    """provider, 모델명, 키의 환경변수 이름을 반환합니다. 키 값은 노출하지 않습니다."""
     provider = os.getenv("MODEL_PROVIDER", "google_genai").strip()
     if provider not in MODEL_DEFAULTS:
         raise ValueError(f"지원하지 않는 MODEL_PROVIDER입니다: {provider}")
@@ -281,10 +283,9 @@ def model_settings() -> tuple[str, str, str]:
 
 
 def is_mock_mode() -> bool:
-    """선택한 provider의 키가 없을 때만 개발용 예시를 사용한다."""
+    """선택한 provider의 키가 없을 때만 개발용 예시를 사용합니다."""
     _, _, key_name = model_settings()
     return os.getenv(key_name, "").strip() in {"", "fake-key"}
-
 
 # %% time_helpers
 def _days(start: date, end: date) -> list[date]:
@@ -292,7 +293,7 @@ def _days(start: date, end: date) -> list[date]:
 
 
 def _matches(day: date, recurrence: Recurrence, event_date: date | None = None) -> bool:
-    """고정 일정·반복 목표·가용 조건에 같은 요일 판정을 사용한다."""
+    """고정 일정·반복 목표·가용 조건에 같은 요일 판정을 사용합니다."""
     if recurrence == "once":
         return day == event_date
     return {
@@ -314,7 +315,7 @@ def _duration(event: CalendarEvent) -> int:
 def _event_bounds(
     day: date, start_value: str, end_value: str, *, overnight: bool = False
 ) -> tuple[datetime, datetime]:
-    """24:00은 다음 날 00:00으로 변환한다. 야간 고정 일정만 자정 넘김을 허용한다."""
+    """24:00은 다음 날 00:00으로 변환합니다. 야간 고정 일정만 자정 넘김을 허용합니다."""
     midnight = datetime.combine(day, time())
     start = midnight + timedelta(minutes=_clock_minutes(start_value))
     end = midnight + timedelta(minutes=_clock_minutes(end_value))
@@ -324,14 +325,14 @@ def _event_bounds(
 
 
 def _convert_planned_event(event: PlannedEvent) -> CalendarEvent:
-    # 초안의 거꾸로 된 시간을 다음 날로 보정하지 않고 Validator에 그대로 전달한다.
+    # 초안의 잘못된 시간을 다음 날로 보정하지 않고 Validator에 그대로 전달합니다.
     start, end = _event_bounds(event.date, event.start_time, event.end_time)
     return CalendarEvent(
         title=event.title, start=start, end=end, kind="generated",
         goal=event.goal, reason=event.reason,
     )
 
-
+# %% fixed_and_windows
 def _normalize_plan_period(plan: PlanSpec) -> PlanSpec:
     warnings = list(plan.warnings)
     plan_end = plan.plan_end
@@ -348,7 +349,7 @@ def _normalize_plan_period(plan: PlanSpec) -> PlanSpec:
 
 
 def _expand_fixed_schedules(plan: PlanSpec) -> list[CalendarEvent]:
-    """LLM에게 반복 이벤트를 나열시키지 않고 Python으로 날짜별 일정을 펼친다."""
+    """LLM에게 반복 이벤트를 나열시키지 않고 Python으로 날짜별 일정을 펼칩니다."""
     events = []
     for schedule in plan.fixed_schedules:
         for day in _days(plan.plan_start, plan.plan_end):
@@ -371,19 +372,19 @@ def _expected_dates(goal: ParsedGoal, plan: PlanSpec) -> list[date]:
 
 
 def _overlaps(event: CalendarEvent, other: CalendarEvent) -> bool:
-    # 끝 시각과 다음 시작 시각이 같은 인접 일정은 충돌이 아니다.
+    # 끝 시각과 다음 시작 시각이 같은 인접 일정은 충돌이 아닙니다.
     return event.start < other.end and event.end > other.start
 
 
 def _within_time_window(
     event: CalendarEvent, start_time: str | None, end_time: str | None,
 ) -> bool:
-    """활동 시간과 요일별 가용 시간에 같은 범위 검사를 사용한다."""
+    """활동 시간과 요일별 가용 시간에 같은 범위 검사를 사용합니다."""
     start_limit = _clock_minutes(start_time or "00:00")
     end_limit = _clock_minutes(end_time or "24:00")
     event_start = event.start.hour * 60 + event.start.minute
     event_end = event_start + _duration(event)
-    # 20:00~01:00처럼 자정을 넘는 가능 시간도 하나의 구간으로 비교한다.
+    # 20:00~01:00처럼 자정을 넘는 가능 시간도 하나의 구간으로 비교합니다.
     if end_limit <= start_limit:
         end_limit += 24 * 60
         if event_start < start_limit:
@@ -403,13 +404,12 @@ def _explicit_unavailable_blocks(
     return [_event_bounds(day, start, end, overnight=True)
             for start, end in pairs if start and end]
 
-
 # %% event_validation
 def _event_issues(
     index: int, event: CalendarEvent, plan: PlanSpec,
     goal: ParsedGoal | None, fixed_events: list[CalendarEvent],
 ) -> list[ValidationIssue]:
-    """한 건만 보고 판단할 수 있는 시간·목표·사용자 조건을 검사한다."""
+    """한 건만 보고 판단할 수 있는 시간·목표·사용자 조건을 검사합니다."""
     issues = []
 
     def add(code: str, message: str) -> None:
@@ -417,7 +417,7 @@ def _event_issues(
 
     if event.end <= event.start:
         add("INVALID_TIME", f"'{event.title}'의 종료 시각이 시작 시각보다 늦지 않습니다.")
-        return issues  # 음수 길이를 이후 일일 합계에 더하지 않는다.
+        return issues  # 음수 길이를 이후 일일 합계에 더하지 않습니다.
     if not plan.plan_start <= event.start.date() <= plan.plan_end:
         add("OUTSIDE_PLAN", f"'{event.title}'이 계획 기간 밖에 있습니다.")
     if goal is None:
@@ -428,13 +428,13 @@ def _event_issues(
     if goal.recurrence in {"weekdays", "weekends"} and not _matches(event.start.date(), goal.recurrence):
         add("RECURRENCE_DAY", f"'{event.goal}'이 {DAY_LABELS[goal.recurrence]} 반복 조건을 벗어났습니다.")
     if goal.recurrence != "flexible" and goal.session_minutes:
-        # 반복 습관의 길이에만 허용 오차를 적용한다. flexible 세션은 강제하지 않는다.
+        # 반복 습관의 길이에만 허용 오차를 적용합니다. flexible 세션은 강제하지 않습니다.
         tolerance = max(10, round(goal.session_minutes * 0.2))
         if abs(_duration(event) - goal.session_minutes) > tolerance:
             add("SESSION_DURATION", f"'{event.goal}'의 회당 시간이 {goal.session_minutes}분과 크게 다릅니다.")
     if not _within_time_window(event, plan.lifestyle.active_start, plan.lifestyle.active_end):
         add("USER_TIME_CONSTRAINT", f"'{event.title}'이 사용자의 활동 가능 시간을 벗어났습니다.")
-    # 자정을 넘는 생활 시간은 전날 시작한 구간과도 비교한다.
+    # 자정을 넘는 생활 시간은 전날 시작한 구간과도 비교합니다.
     blocks = [block for day in (event.start.date() - timedelta(days=1), event.start.date())
               for block in _explicit_unavailable_blocks(day, plan.lifestyle)]
     if any(event.start < end and event.end > start for start, end in blocks):
@@ -450,24 +450,23 @@ def _event_issues(
             add("AVAILABILITY_TIME", f"'{event.title}'이 {label} 가능 시간 {rule.start_time or '00:00'}~{rule.end_time or '24:00'}을 벗어났습니다.")
     return issues
 
-
 # %% draft_validation
 def validate_draft(
     plan: PlanSpec, draft: DraftSchedule,
     fixed_events: list[CalendarEvent] | None = None,
 ) -> ValidationResult:
-    """개별 일정 → 일정 간 충돌·하루 한도 → 반복 누락 순서로 검증한다."""
+    """개별 일정 → 일정 간 충돌·하루 한도 → 반복 누락 순서로 검증합니다."""
     fixed_events = fixed_events if fixed_events is not None else _expand_fixed_schedules(plan)
     goals = {goal.title: goal for goal in plan.goals}
     events = [_convert_planned_event(event) for event in draft.events]
     issues = []
 
-    # 1. 먼저 개별 일정의 명시적인 오류를 수집한다.
+    # 1. 먼저 개별 일정의 명시적인 오류를 수집합니다.
     for index, event in enumerate(events):
         issues.extend(_event_issues(index, event, plan, goals.get(event.goal), fixed_events))
     invalid = {issue.event_index for issue in issues}
 
-    # 2. 제외된 일정은 다시 비교하거나 누적하지 않는다. 정상 일정을 연쇄 제외하지 않기 위함이다.
+    # 2. 제외된 일정은 다시 비교하거나 누적하지 않습니다. 정상 일정이 연쇄적으로 제외되는 것을 막기 위함입니다.
     accepted: list[CalendarEvent] = []
     daily_total: dict[date, int] = defaultdict(int)
     for index in sorted(range(len(events)), key=lambda i: events[i].start):
@@ -494,7 +493,7 @@ def validate_draft(
         accepted.append(event)
         daily_total[day] = total
 
-    # 3. 실제로 남은 일정의 날짜를 기준으로 daily/평일/주말 누락을 찾는다.
+    # 3. 실제로 남은 일정의 날짜를 기준으로 daily/평일/주말 누락을 찾습니다.
     for goal in plan.goals:
         if goal.recurrence not in {"daily", "weekdays", "weekends"}:
             continue
@@ -507,7 +506,6 @@ def validate_draft(
                 message=f"'{goal.title}' 반복 일정이 누락된 날짜: {dates}",
             ))
     return ValidationResult(valid=not issues, issues=issues)
-
 
 # %% result_building
 def _required_minutes(goal: ParsedGoal, plan: PlanSpec) -> int | None:
@@ -522,14 +520,14 @@ def _build_schedule_result(
     plan: PlanSpec, draft: DraftSchedule, validation: ValidationResult,
     fixed_events: list[CalendarEvent],
 ) -> ScheduleResult:
-    """위반 이벤트만 제외하고, 실제 남은 이벤트로 시간과 부족량을 집계한다."""
+    """위반 이벤트만 제외하고, 실제 남은 이벤트로 시간과 부족량을 집계합니다."""
     invalid = {issue.event_index for issue in validation.issues if issue.event_index is not None}
     generated = [_convert_planned_event(event) for i, event in enumerate(draft.events) if i not in invalid]
     allocated: dict[str, int] = defaultdict(int)
     for event in generated:
         allocated[event.goal] += _duration(event)
 
-    # 해석 가정은 plan_spec.warnings에 유지하고 최종 주의사항과 섞지 않는다.
+    # 해석 가정은 plan_spec.warnings에 유지하고 최종 주의사항과 섞지 않습니다.
     warnings = list(draft.warnings) + [f"미해결: {issue.message}" for issue in validation.issues]
     summaries = []
     for goal in plan.goals:
@@ -552,19 +550,18 @@ def _build_schedule_result(
         warning=" ".join(dict.fromkeys(warnings)) or None,
     )
 
-
-# %% chains
+# %% process_draft
 def process_draft(
     plan: PlanSpec, draft: DraftSchedule,
     repair: Callable[[dict[str, str]], DraftSchedule] | None = None,
     *, fixed_events: list[CalendarEvent] | None = None,
 ) -> ScheduleResult:
-    """항상 검증하고, 필요한 경우에만 Repair를 한 번 실행한다."""
+    """항상 검증하고, 필요한 경우에만 Repair를 한 번 실행합니다."""
     plan = _normalize_plan_period(plan)
     fixed = fixed_events if fixed_events is not None else _expand_fixed_schedules(plan)
     validation = validate_draft(plan, draft, fixed)
     if not validation.valid and repair is not None:
-        # 검증 오류와 기존 초안을 수정 체인의 입력으로 전달한다.
+        # 검증 오류와 기존 초안을 수정 체인의 입력으로 전달합니다.
         draft = repair({
             "plan_spec_json": _json(plan), "fixed_events_json": _json(fixed),
             "draft_json": _json(draft), "issues_json": _json(validation.issues),
@@ -577,13 +574,14 @@ def _json(value: BaseModel | list[BaseModel]) -> str:
     data = [item.model_dump(mode="json") for item in value] if isinstance(value, list) else value.model_dump(mode="json")
     return json.dumps(data, ensure_ascii=False)
 
-
+# %% build_chain
 def build_chain():
-    """형식이 다른 세 LLM 체인을 만들고, Python 분기 처리를 LCEL에 연결한다."""
+    """형식이 다른 세 LLM 체인을 만들고, Python 분기 처리를 LCEL에 연결합니다."""
     provider, model_name, _ = model_settings()
-    llm = init_chat_model(model_name, model_provider=provider, temperature=0)
+    model_options = {"temperature": 0} if provider == "openai" else {}
+    llm = init_chat_model(model_name, model_provider=provider, **model_options)
 
-    # 실습과 같은 Prompt | Model 구조이며, 각 단계의 출력 스키마만 다르다.
+    # 실습과 같은 Prompt | Model 구조이며, 각 단계의 출력 스키마만 다릅니다.
     interpret_chain = INTERPRET_PROMPT | llm.with_structured_output(PlanSpec)
     planner_chain = PLAN_PROMPT | llm.with_structured_output(DraftSchedule)
     repair_chain = REPAIR_PROMPT | llm.with_structured_output(DraftSchedule)
@@ -598,10 +596,9 @@ def build_chain():
 
     return interpret_chain | RunnableLambda(plan_validate_repair)
 
-
 # %% mock_plan
 def _mock_interpretation(user_input: str, today: date) -> PlanSpec:
-    """두 시연 사례의 고정 데이터다. 임의 자연어를 해석하는 모델이 아니다."""
+    """두 시연 사례의 고정 데이터입니다. 임의 자연어를 해석하는 모델은 아닙니다."""
     if "발표" in user_input:
         deadline = today + timedelta(days=7 - today.weekday() + 4)
         return PlanSpec(
@@ -620,8 +617,8 @@ def _mock_interpretation(user_input: str, today: date) -> PlanSpec:
             constraints=["한 번에 너무 오래 하지 않기"],
         )
 
-    exam = date(today.year, 10, 5)
-    has_exam = "10월 초" in user_input and today <= exam
+    exam = date(today.year, 10, 15)
+    has_exam = ("10월 중순" in user_input or "10월 초" in user_input) and today <= exam
     end = min(exam if has_exam else today + timedelta(days=13), today + timedelta(days=27))
     plan = PlanSpec(plan_start=today, plan_end=end, goals=[])
     if has_exam:
@@ -657,10 +654,9 @@ def _mock_interpretation(user_input: str, today: date) -> PlanSpec:
         ))
     return plan
 
-
 # %% mock_draft
 def _mock_draft(plan: PlanSpec) -> DraftSchedule:
-    """예시 시간표를 날짜별 초안으로 변환한다. 실제 모델은 호출하지 않는다."""
+    """예시 시간표를 날짜별 초안으로 변환합니다. 실제 모델은 호출하지 않습니다."""
     goals = {goal.title: goal for goal in plan.goals}
     if "발표 자료 제작" in goals:
         sessions = [
@@ -704,10 +700,9 @@ def _mock_draft(plan: PlanSpec) -> DraftSchedule:
     return DraftSchedule(events=events, strategy_summary=
         "평일에는 부트캠프 이후 주요 학습을 하나만 배치했습니다. 주말은 한국사와 SKCT 집중 세션에 활용했습니다. 영단어는 매일 짧게 유지했습니다.")
 
-
 # %% entry_point
 def generate_schedule(user_input: str, current_date: date | None = None) -> ScheduleResult:
-    """앱과 노트북이 공유하는 진입점. 실제 키가 있으면 LLM 체인을 실행한다."""
+    """앱과 노트북이 공유하는 진입점입니다. 실제 키가 있으면 LLM 체인을 실행합니다."""
     if not user_input.strip():
         raise ValueError("목표와 일정을 입력해 주세요.")
     today = current_date or date.today()
