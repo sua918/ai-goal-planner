@@ -29,7 +29,7 @@ END_TIME_PATTERN = r"^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$"
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 DAY_LABELS = {"daily": "매일", "weekdays": "평일", "weekends": "주말"}
 MODEL_DEFAULTS = {
-    "google_genai": ("gemini-3.6-flash", "GOOGLE_API_KEY"),
+    "google_genai": ("gemini-3.5-flash-lite", "GOOGLE_API_KEY"),
     "openai": ("gpt-4.1-mini", "OPENAI_API_KEY"),
 }
 
