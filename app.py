@@ -1,5 +1,8 @@
-from datetime import timedelta
+import re
+from datetime import datetime, timedelta, timezone
+from hashlib import sha1
 from html import escape
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -75,6 +78,14 @@ st.markdown(
     .stButton > button:hover, .stButton > button:focus {{
         border-color: var(--ink); background: var(--ink); color: white; box-shadow: none;
     }}
+    [data-testid="stDownloadButton"] > button {{
+        min-height: 2.55rem; width: 100%; border: 1px solid rgba(52, 73, 102, .28);
+        border-radius: .7rem; background: white; color: var(--yale); font-weight: 700; box-shadow: none;
+    }}
+    [data-testid="stDownloadButton"] > button:hover,
+    [data-testid="stDownloadButton"] > button:focus {{
+        border-color: var(--yale); background: rgba(180, 205, 237, .24); color: var(--ink); box-shadow: none;
+    }}
 
     [data-testid="stDialog"] [data-testid="stDialogContainer"] > div {{ border-radius: 1rem; }}
     [data-testid="stTextArea"] textarea {{
@@ -110,6 +121,11 @@ st.markdown(
 
     [data-testid="stExpander"] {{ border-color: var(--line); border-radius: .75rem; background: rgba(255, 255, 255, .58); }}
     [data-testid="stAlert"] {{ border-radius: .65rem; font-size: .78rem; }}
+    .strategy-list, .detail-list {{ margin: .35rem 0 .75rem; padding-left: 1.15rem; }}
+    .strategy-list li, .detail-list li {{
+        margin: .28rem 0; color: var(--ink); font-size: .82rem; line-height: 1.48;
+        word-break: keep-all; overflow-wrap: anywhere;
+    }}
     .legend {{ display: flex; flex-wrap: wrap; gap: .8rem; margin: .7rem 0 .1rem; color: var(--muted); font-size: .69rem; }}
     .legend-item {{ display: inline-flex; align-items: center; gap: .33rem; }}
     .legend-dot {{ width: .52rem; height: .52rem; border-radius: 50%; }}
@@ -133,6 +149,65 @@ EXAMPLE_INPUT = """10월 초 한국사 시험이 있고 SKCT도 준비해야 해
 평일 9시부터 18시까지는 부트캠프야.
 영단어는 매일 30분씩 하고 싶고, 평일 저녁에는 하루 2시간 정도만 쓸 수 있어.
 주말은 비교적 여유로워."""
+
+
+def _ics_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\r\n", "\\n").replace("\n", "\\n").replace(";", "\\;").replace(",", "\\,")
+
+
+def _fold_ics_line(line: str) -> str:
+    parts: list[str] = []
+    current = ""
+    for character in line:
+        if current and len((current + character).encode("utf-8")) > 75:
+            parts.append(current)
+            current = " " + character
+        else:
+            current += character
+    parts.append(current)
+    return "\r\n".join(parts)
+
+
+def _schedule_to_ics(result) -> bytes:
+    seoul = ZoneInfo("Asia/Seoul")
+    created_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//AI Goal Planner//Schedule//KO",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:AI 목표 플래너",
+    ]
+    for event in result.events:
+        start = event.start.replace(tzinfo=seoul) if event.start.tzinfo is None else event.start
+        end = event.end.replace(tzinfo=seoul) if event.end.tzinfo is None else event.end
+        uid_source = f"{event.title}|{start.isoformat()}|{end.isoformat()}|{event.kind}"
+        description = [f"유형: {'고정 일정' if event.kind == 'fixed' else 'AI 생성 일정'}"]
+        if event.goal:
+            description.append(f"목표: {event.goal}")
+        if event.reason:
+            description.append(f"배치 이유: {event.reason}")
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{sha1(uid_source.encode('utf-8')).hexdigest()}@ai-goal-planner",
+            f"DTSTAMP:{created_at}",
+            f"DTSTART:{start.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
+            f"DTEND:{end.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
+            f"SUMMARY:{_ics_escape(event.title)}",
+            f"DESCRIPTION:{_ics_escape(chr(10).join(description))}",
+            "END:VEVENT",
+        ])
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(_fold_ics_line(line) for line in lines) + "\r\n").encode("utf-8")
+
+
+def _strategy_items(summary: str | None) -> list[str]:
+    if not summary:
+        return []
+    chunks = re.split(r"\n+|(?<=[.!?])\s+", summary.strip())
+    items = [re.sub(r"^(?:[-•]|\d+[.)])\s*", "", chunk).strip() for chunk in chunks]
+    return [item for item in items if item][:4]
 
 
 def _calendar_events(result) -> list[dict]:
@@ -217,7 +292,8 @@ def _render_plan_details(result) -> None:
     with st.expander("AI가 이해한 계획"):
         if result.strategy_summary:
             st.caption("계획 전략")
-            st.write(result.strategy_summary)
+            strategy_html = "".join(f"<li>{escape(item)}</li>" for item in _strategy_items(result.strategy_summary))
+            st.html(f'<ul class="strategy-list">{strategy_html}</ul>')
 
         st.caption("고정 일정")
         if result.plan_spec.fixed_schedules:
@@ -271,17 +347,21 @@ def _render_plan_details(result) -> None:
 
         if result.plan_spec.warnings:
             st.caption("해석 과정의 가정")
-            st.markdown("\n".join(f"- {escape(note)}" for note in result.plan_spec.warnings))
+            assumptions = "".join(f"<li>{escape(note)}</li>" for note in result.plan_spec.warnings)
+            st.html(f'<ul class="detail-list">{assumptions}</ul>')
         if result.plan_spec.constraints:
             st.caption("기타 사용자 조건")
-            st.markdown("\n".join(f"- {escape(note)}" for note in result.plan_spec.constraints))
+            constraints = "".join(f"<li>{escape(note)}</li>" for note in result.plan_spec.constraints)
+            st.html(f'<ul class="detail-list">{constraints}</ul>')
 
 
 def render_app() -> None:
     result = st.session_state.get("schedule")
     demo_badge = '<span class="demo-badge">DEMO</span>' if is_mock_mode() else ""
 
-    header_main, header_action = st.columns([5.2, 1], vertical_alignment="center")
+    header_columns = [4.8, 1.1, 1.1] if result else [5.2, 1]
+    columns = st.columns(header_columns, vertical_alignment="center")
+    header_main, header_action = columns[:2]
     with header_main:
         period = (
             f"{result.plan_start:%Y.%m.%d} – {result.plan_end:%Y.%m.%d}"
@@ -297,6 +377,15 @@ def render_app() -> None:
         button_label = "새 계획 만들기 / 수정" if result else "계획 만들기"
         if st.button(button_label, type="primary", use_container_width=True):
             _plan_dialog()
+    if result:
+        with columns[2]:
+            st.download_button(
+                "캘린더 다운로드",
+                data=_schedule_to_ics(result),
+                file_name=f"ai_plan_{result.plan_start:%Y%m%d}_{result.plan_end:%Y%m%d}.ics",
+                mime="text/calendar; charset=utf-8",
+                use_container_width=True,
+            )
 
     if not result:
         st.html(

@@ -89,7 +89,7 @@ class PlannedEvent(BaseModel):
 
 class DraftSchedule(BaseModel):
     events: list[PlannedEvent]
-    strategy_summary: str
+    strategy_summary: str = Field(description="2~4개의 짧은 핵심 문장으로 작성한 계획 전략")
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -189,6 +189,7 @@ PlanSpec과 날짜별로 펼쳐진 fixed_events를 보고 generated 일정만 Dr
 - availability_rules의 preferred/avoid는 배치 판단에 반영하되, 선호만으로 일정량을 기계적으로 채우거나 비우지 않는다.
 - event.goal은 PlanSpec의 goal title과 정확히 일치시킨다.
 - event.reason에는 필요한 경우 왜 그 시간에 배치했는지 짧게 적는다.
+- strategy_summary는 실행 전략만 2~4개의 짧은 핵심 문장으로 작성한다. 긴 한 문단이나 불필요한 세부 설명은 피한다.
 """,
         ),
         (
@@ -213,6 +214,7 @@ REPAIR_PROMPT = ChatPromptTemplate.from_messages(
             """당신은 일정 검증 결과를 반영하는 수정 플래너다.
 원래 계획의 의도와 좋은 배치는 최대한 유지하고, validation issues를 해결하는 데 필요한 일정만 수정해 전체 DraftSchedule을 다시 반환한다.
 fixed 일정은 events에 넣지 말고, generated 일정만 반환한다.
+strategy_summary는 수정된 계획을 반영하되 2~4개의 짧은 핵심 문장으로 유지한다.
 """,
         ),
         (
@@ -489,7 +491,7 @@ def _required_minutes(goal: ParsedGoal, plan: PlanSpec) -> int | None:
 def _build_schedule_result(plan: PlanSpec, draft: DraftSchedule, validation: ValidationResult, fixed_events: list[CalendarEvent]) -> ScheduleResult:
     generated_events = _valid_generated_events(draft, validation)
     events = sorted(fixed_events + generated_events, key=lambda event: event.start)
-    warnings = list(plan.warnings) + list(draft.warnings)
+    warnings = list(draft.warnings)
     if not validation.valid:
         warnings.extend(f"자동 수정 후 미해결: {issue.message}" for issue in validation.issues)
 
@@ -628,7 +630,7 @@ def _mock_draft(plan: PlanSpec) -> DraftSchedule:
                     remaining_minutes["SKCT 준비"] -= 90
             if "영단어" in goal_titles:
                 events.append(PlannedEvent(title="영단어", date=day, start_time="20:00", end_time="20:30", goal="영단어", reason="주말에도 짧은 반복 습관 유지"))
-    return DraftSchedule(events=events, strategy_summary="평일에는 부트캠프 이후 식사와 휴식을 고려해 주요 학습을 하나만 배치하고, 주말은 한국사와 SKCT의 집중 세션에 활용했습니다. 영단어는 매일 짧게 유지했습니다.")
+    return DraftSchedule(events=events, strategy_summary="평일에는 부트캠프 이후 주요 학습을 하나만 배치했습니다. 주말은 한국사와 SKCT 집중 세션에 활용했습니다. 영단어는 매일 짧게 유지했습니다.")
 
 
 def generate_schedule(user_input: str, current_date: date | None = None) -> ScheduleResult:
