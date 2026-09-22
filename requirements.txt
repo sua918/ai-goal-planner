@@ -3,7 +3,8 @@ langchain-openai>=0.3,<2.0
 langchain-google-genai
 pydantic>=2.10,<3.0
 python-dotenv>=1.0,<2.0
-pandas
+pandas>=2.2,<3.0
 streamlit>=1.40,<2.0
 streamlit-calendar>=1.2,<2.0
-tzdata>=2024.1
+tzdata
+ipykernel>=6.29,<8.0

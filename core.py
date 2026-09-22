@@ -1,5 +1,13 @@
+"""자연어 해석 → 일정 초안 → 검증 → 한 번의 수정으로 이어지는 핵심 로직.
+
+LLM은 배치를 판단하고, Python은 시간 계산과 명시된 제약을 검사한다.
+이 모듈은 Streamlit 없이도 사용할 수 있다.
+"""
+
+# %% imports
 import json
 import os
+from collections import defaultdict
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from typing import Literal
@@ -10,17 +18,27 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, Field
 
-
-load_dotenv()
+# 배포 환경에 주입된 값은 유지하고, 로컬에서는 현재 폴더의 .env를 읽는다.
+load_dotenv(".env")
 
 Recurrence = Literal["daily", "weekdays", "weekends", "flexible", "once"]
 FixedRecurrence = Literal["daily", "weekdays", "weekends", "once"]
 Priority = Literal["high", "medium", "low"]
 TIME_PATTERN = r"^(?:[01]\d|2[0-3]):[0-5]\d$"
 END_TIME_PATTERN = r"^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$"
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+DAY_LABELS = {"daily": "매일", "weekdays": "평일", "weekends": "주말"}
+MODEL_DEFAULTS = {
+    "google_genai": ("gemini-3.6-flash", "GOOGLE_API_KEY"),
+    "openai": ("gpt-4.1-mini", "OPENAI_API_KEY"),
+}
 
+
+# %% input_models
 
 class CalendarEvent(BaseModel):
+    """화면과 내보내기에 사용하는 일정. fixed는 원래 일정, generated는 AI 배치다."""
+
     title: str
     start: datetime
     end: datetime
@@ -28,8 +46,9 @@ class CalendarEvent(BaseModel):
     goal: str | None = None
     reason: str | None = None
 
-
 class ParsedGoal(BaseModel):
+    """목표의 시간·마감 조건. 명시되지 않은 값은 None으로 남긴다."""
+
     title: str
     deadline: date | None = None
     priority: Priority
@@ -40,16 +59,18 @@ class ParsedGoal(BaseModel):
     required_minutes: int | None = Field(default=None, ge=1)
     constraints: list[str] = Field(default_factory=list)
 
-
 class FixedSchedule(BaseModel):
+    """반복 규칙을 가진 고정 일정. once일 때 event_date를 사용한다."""
+
     title: str
     recurrence: FixedRecurrence
     start_time: str = Field(pattern=TIME_PATTERN)
     end_time: str = Field(pattern=END_TIME_PATTERN)
     event_date: date | None = None
 
-
 class LifestylePreferences(BaseModel):
+    """사용자가 직접 말한 활동·식사·취침 시간만 저장한다."""
+
     active_start: str | None = Field(default=None, pattern=TIME_PATTERN)
     active_end: str | None = Field(default=None, pattern=TIME_PATTERN)
     lunch_start: str | None = Field(default=None, pattern=TIME_PATTERN)
@@ -58,16 +79,18 @@ class LifestylePreferences(BaseModel):
     dinner_end: str | None = Field(default=None, pattern=TIME_PATTERN)
     wind_down_start: str | None = Field(default=None, pattern=TIME_PATTERN)
 
-
 class AvailabilityRule(BaseModel):
+    """가능 시간과 하루 한도는 검증하고, preference는 LLM 판단에 맡긴다."""
+
     recurrence: Literal["daily", "weekdays", "weekends"]
     start_time: str | None = Field(default=None, pattern=TIME_PATTERN)
     end_time: str | None = Field(default=None, pattern=END_TIME_PATTERN)
     max_minutes_per_day: int | None = Field(default=None, ge=1)
     preference: Literal["preferred", "normal", "avoid"] = "normal"
 
-
 class PlanSpec(BaseModel):
+    """Interpretation 체인이 반환하는 목표와 제약의 묶음."""
+
     plan_start: date
     plan_end: date
     goals: list[ParsedGoal]
@@ -77,8 +100,11 @@ class PlanSpec(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
+# %% output_models
 
 class PlannedEvent(BaseModel):
+    """Planner가 제안한 학습·작업 한 건. 아직 검증되지 않은 초안이다."""
+
     title: str
     date: date
     start_time: str = Field(pattern=TIME_PATTERN)
@@ -86,25 +112,29 @@ class PlannedEvent(BaseModel):
     goal: str
     reason: str | None = None
 
-
 class DraftSchedule(BaseModel):
+    """Planner와 Repair가 공유하는 구조화된 출력 형식."""
+
     events: list[PlannedEvent]
     strategy_summary: str = Field(description="2~4개의 짧은 핵심 문장으로 작성한 계획 전략")
     warnings: list[str] = Field(default_factory=list)
 
-
 class ValidationIssue(BaseModel):
+    """event_index로 문제 일정을 가리킨다. 누락처럼 일정이 없으면 None이다."""
+
     code: str
     message: str
     event_index: int | None = None
 
-
 class ValidationResult(BaseModel):
+    """검증 결과를 Repair의 입력으로 전달한다."""
+
     valid: bool
     issues: list[ValidationIssue] = Field(default_factory=list)
 
-
 class GoalSummary(BaseModel):
+    """최종 남은 일정의 시간을 합산한 목표별 요약."""
+
     title: str
     priority: Priority
     priority_reason: str
@@ -113,8 +143,9 @@ class GoalSummary(BaseModel):
     allocated_hours: float = Field(default=0, ge=0)
     shortage_hours: float = Field(default=0, ge=0)
 
-
 class ScheduleResult(BaseModel):
+    """검증 후 남은 일정과 가정·주의사항을 화면에 전달한다."""
+
     plan_start: date
     plan_end: date
     events: list[CalendarEvent]
@@ -123,7 +154,8 @@ class ScheduleResult(BaseModel):
     strategy_summary: str | None = None
     warning: str | None = None
 
-
+# %% interpret_prompt
+# 역할과 제약은 system, 실행마다 바뀌는 사용자 원문은 human에 둔다.
 INTERPRET_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -160,7 +192,8 @@ INTERPRET_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
-
+# %% plan_prompt
+# 원문 대신 PlanSpec과 날짜별 고정 일정을 보내 배치에 필요한 맥락을 좁힌다.
 PLAN_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -206,7 +239,8 @@ PlanSpec과 날짜별로 펼쳐진 fixed_events를 보고 generated 일정만 Dr
     ]
 )
 
-
+# %% repair_prompt
+# 기존 초안과 검증 오류를 함께 보내 수정 범위를 제한한다.
 REPAIR_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -235,98 +269,37 @@ strategy_summary는 수정된 계획을 반영하되 2~4개의 짧은 핵심 문
     ]
 )
 
-
-def _model():
-    provider = os.getenv("MODEL_PROVIDER", "google_genai")
-    if provider == "openai":
-        default_model = "gpt-4.1-mini"
-    elif provider == "google_genai":
-        default_model = "gemini-3.6-flash"
-    else:
+# %% model_config
+def model_settings() -> tuple[str, str, str]:
+    """provider, 모델명, 키의 환경변수 이름을 반환한다. 키 값은 노출하지 않는다."""
+    provider = os.getenv("MODEL_PROVIDER", "google_genai").strip()
+    if provider not in MODEL_DEFAULTS:
         raise ValueError(f"지원하지 않는 MODEL_PROVIDER입니다: {provider}")
-    return init_chat_model(
-        os.getenv("MODEL_NAME", default_model),
-        model_provider=provider,
-        temperature=0,
-    )
+    default_model, key_name = MODEL_DEFAULTS[provider]
+    model_name = os.getenv("MODEL_NAME", "").strip() or default_model
+    return provider, model_name, key_name
 
 
-def _matches(day: date, recurrence: Recurrence, event_date: date | None) -> bool:
-    if recurrence == "daily":
-        return True
-    if recurrence == "weekdays":
-        return day.weekday() < 5
-    if recurrence == "weekends":
-        return day.weekday() >= 5
+def is_mock_mode() -> bool:
+    """선택한 provider의 키가 없을 때만 개발용 예시를 사용한다."""
+    _, _, key_name = model_settings()
+    return os.getenv(key_name, "").strip() in {"", "fake-key"}
+
+
+# %% time_helpers
+def _days(start: date, end: date) -> list[date]:
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+
+def _matches(day: date, recurrence: Recurrence, event_date: date | None = None) -> bool:
+    """고정 일정·반복 목표·가용 조건에 같은 요일 판정을 사용한다."""
     if recurrence == "once":
         return day == event_date
-    return False
-
-
-def _event_bounds(day: date, start_value: str, end_value: str) -> tuple[datetime, datetime]:
-    start = datetime.combine(day, time.fromisoformat(start_value))
-    if end_value == "24:00":
-        end = datetime.combine(day + timedelta(days=1), time())
-    else:
-        end = datetime.combine(day, time.fromisoformat(end_value))
-        if end <= start:
-            end += timedelta(days=1)
-    return start, end
-
-
-def _planned_bounds(event: PlannedEvent) -> tuple[datetime, datetime]:
-    start = datetime.combine(event.date, time.fromisoformat(event.start_time))
-    end = (
-        datetime.combine(event.date + timedelta(days=1), time())
-        if event.end_time == "24:00"
-        else datetime.combine(event.date, time.fromisoformat(event.end_time))
-    )
-    return start, end
-
-
-def _normalize_plan_period(plan: PlanSpec) -> PlanSpec:
-    warnings = list(plan.warnings)
-    maximum_end = plan.plan_start + timedelta(days=27)
-    plan_end = plan.plan_end
-    if plan_end < plan.plan_start:
-        plan_end = plan.plan_start + timedelta(days=13)
-        warnings.append("계획 종료일이 시작일보다 빨라 기본 14일로 조정했습니다.")
-    if plan_end > maximum_end:
-        plan_end = maximum_end
-        warnings.append(f"상세 일정은 {maximum_end.isoformat()}까지 최대 4주만 배치합니다.")
-    return plan.model_copy(update={"plan_end": plan_end, "warnings": list(dict.fromkeys(warnings))})
-
-
-def _expand_fixed_schedules(plan: PlanSpec) -> list[CalendarEvent]:
-    events: list[CalendarEvent] = []
-    total_days = (plan.plan_end - plan.plan_start).days + 1
-    for schedule in plan.fixed_schedules:
-        for offset in range(total_days):
-            day = plan.plan_start + timedelta(days=offset)
-            if not _matches(day, schedule.recurrence, schedule.event_date):
-                continue
-            start, end = _event_bounds(day, schedule.start_time, schedule.end_time)
-            events.append(CalendarEvent(title=schedule.title, start=start, end=end, kind="fixed"))
-    return sorted(events, key=lambda event: event.start)
-
-
-def _expected_dates(goal: ParsedGoal, plan: PlanSpec) -> list[date]:
-    days = [plan.plan_start + timedelta(days=offset) for offset in range((plan.plan_end - plan.plan_start).days + 1)]
-    if goal.deadline:
-        days = [day for day in days if day <= goal.deadline]
-    if goal.recurrence == "daily":
-        return days
-    if goal.recurrence == "weekdays":
-        return [day for day in days if day.weekday() < 5]
-    if goal.recurrence == "weekends":
-        return [day for day in days if day.weekday() >= 5]
-    if goal.recurrence == "once":
-        return [min(max(goal.deadline or plan.plan_end, plan.plan_start), plan.plan_end)]
-    return []
-
-
-def _overlaps(event: CalendarEvent, other: CalendarEvent) -> bool:
-    return event.start < other.end and event.end > other.start
+    return {
+        "daily": True,
+        "weekdays": day.weekday() < 5,
+        "weekends": day.weekday() >= 5,
+    }.get(recurrence, False)
 
 
 def _clock_minutes(value: str) -> int:
@@ -334,15 +307,83 @@ def _clock_minutes(value: str) -> int:
     return hour * 60 + minute
 
 
-def _within_active_hours(event: CalendarEvent, lifestyle: LifestylePreferences) -> bool:
-    if not lifestyle.active_start and not lifestyle.active_end:
-        return True
-    start_limit = _clock_minutes(lifestyle.active_start or "00:00")
-    end_limit = _clock_minutes(lifestyle.active_end or "23:59")
+def _duration(event: CalendarEvent) -> int:
+    return int((event.end - event.start).total_seconds() // 60)
+
+
+def _event_bounds(
+    day: date, start_value: str, end_value: str, *, overnight: bool = False
+) -> tuple[datetime, datetime]:
+    """24:00은 다음 날 00:00으로 변환한다. 야간 고정 일정만 자정 넘김을 허용한다."""
+    midnight = datetime.combine(day, time())
+    start = midnight + timedelta(minutes=_clock_minutes(start_value))
+    end = midnight + timedelta(minutes=_clock_minutes(end_value))
+    if overnight and end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def _convert_planned_event(event: PlannedEvent) -> CalendarEvent:
+    # 초안의 거꾸로 된 시간을 다음 날로 보정하지 않고 Validator에 그대로 전달한다.
+    start, end = _event_bounds(event.date, event.start_time, event.end_time)
+    return CalendarEvent(
+        title=event.title, start=start, end=end, kind="generated",
+        goal=event.goal, reason=event.reason,
+    )
+
+
+def _normalize_plan_period(plan: PlanSpec) -> PlanSpec:
+    warnings = list(plan.warnings)
+    plan_end = plan.plan_end
+    maximum_end = plan.plan_start + timedelta(days=27)
+    if plan_end < plan.plan_start:
+        plan_end = plan.plan_start + timedelta(days=13)
+        warnings.append("계획 종료일이 시작일보다 빨라 기본 14일로 조정했습니다.")
+    if plan_end > maximum_end:
+        plan_end = maximum_end
+        warnings.append(f"상세 일정은 {maximum_end.isoformat()}까지 최대 4주만 배치합니다.")
+    return plan.model_copy(update={
+        "plan_end": plan_end, "warnings": list(dict.fromkeys(warnings)),
+    })
+
+
+def _expand_fixed_schedules(plan: PlanSpec) -> list[CalendarEvent]:
+    """LLM에게 반복 이벤트를 나열시키지 않고 Python으로 날짜별 일정을 펼친다."""
+    events = []
+    for schedule in plan.fixed_schedules:
+        for day in _days(plan.plan_start, plan.plan_end):
+            if not _matches(day, schedule.recurrence, schedule.event_date):
+                continue
+            start, end = _event_bounds(
+                day, schedule.start_time, schedule.end_time, overnight=True,
+            )
+            events.append(CalendarEvent(
+                title=schedule.title, start=start, end=end, kind="fixed",
+            ))
+    return sorted(events, key=lambda event: event.start)
+
+
+def _expected_dates(goal: ParsedGoal, plan: PlanSpec) -> list[date]:
+    last_day = min(goal.deadline or plan.plan_end, plan.plan_end)
+    if goal.recurrence == "once":
+        return [min(max(last_day, plan.plan_start), plan.plan_end)]
+    return [day for day in _days(plan.plan_start, last_day) if _matches(day, goal.recurrence)]
+
+
+def _overlaps(event: CalendarEvent, other: CalendarEvent) -> bool:
+    # 끝 시각과 다음 시작 시각이 같은 인접 일정은 충돌이 아니다.
+    return event.start < other.end and event.end > other.start
+
+
+def _within_time_window(
+    event: CalendarEvent, start_time: str | None, end_time: str | None,
+) -> bool:
+    """활동 시간과 요일별 가용 시간에 같은 범위 검사를 사용한다."""
+    start_limit = _clock_minutes(start_time or "00:00")
+    end_limit = _clock_minutes(end_time or "24:00")
     event_start = event.start.hour * 60 + event.start.minute
-    event_end = event.end.hour * 60 + event.end.minute
-    if event.end.date() > event.start.date():
-        event_end += 24 * 60
+    event_end = event_start + _duration(event)
+    # 20:00~01:00처럼 자정을 넘는 가능 시간도 하나의 구간으로 비교한다.
     if end_limit <= start_limit:
         end_limit += 24 * 60
         if event_start < start_limit:
@@ -351,135 +392,124 @@ def _within_active_hours(event: CalendarEvent, lifestyle: LifestylePreferences) 
     return event_start >= start_limit and event_end <= end_limit
 
 
-def _explicit_unavailable_blocks(day: date, lifestyle: LifestylePreferences) -> list[tuple[datetime, datetime]]:
-    blocks: list[tuple[datetime, datetime]] = []
-    for start_value, end_value in (
+def _explicit_unavailable_blocks(
+    day: date, lifestyle: LifestylePreferences,
+) -> list[tuple[datetime, datetime]]:
+    pairs = [
         (lifestyle.lunch_start, lifestyle.lunch_end),
         (lifestyle.dinner_start, lifestyle.dinner_end),
         (lifestyle.wind_down_start, lifestyle.active_end),
-    ):
-        if start_value and end_value:
-            blocks.append(_event_bounds(day, start_value, end_value))
-    return blocks
+    ]
+    return [_event_bounds(day, start, end, overnight=True)
+            for start, end in pairs if start and end]
 
 
-def _convert_planned_event(event: PlannedEvent) -> CalendarEvent:
-    start, end = _planned_bounds(event)
-    return CalendarEvent(title=event.title, start=start, end=end, kind="generated", goal=event.goal, reason=event.reason)
+# %% event_validation
+def _event_issues(
+    index: int, event: CalendarEvent, plan: PlanSpec,
+    goal: ParsedGoal | None, fixed_events: list[CalendarEvent],
+) -> list[ValidationIssue]:
+    """한 건만 보고 판단할 수 있는 시간·목표·사용자 조건을 검사한다."""
+    issues = []
 
-
-def _availability_applies(day: date, recurrence: Literal["daily", "weekdays", "weekends"]) -> bool:
-    if recurrence == "daily":
-        return True
-    if recurrence == "weekdays":
-        return day.weekday() < 5
-    return day.weekday() >= 5
-
-
-def validate_draft(plan: PlanSpec, draft: DraftSchedule, fixed_events: list[CalendarEvent] | None = None) -> ValidationResult:
-    fixed_events = fixed_events if fixed_events is not None else _expand_fixed_schedules(plan)
-    goal_map = {goal.title: goal for goal in plan.goals}
-    issues: list[ValidationIssue] = []
-    converted: list[tuple[int, CalendarEvent]] = []
-    invalid_indices: set[int] = set()
-
-    def add(code: str, message: str, index: int | None = None) -> None:
+    def add(code: str, message: str) -> None:
         issues.append(ValidationIssue(code=code, message=message, event_index=index))
-        if index is not None:
-            invalid_indices.add(index)
 
-    for index, planned in enumerate(draft.events):
-        event = _convert_planned_event(planned)
-        converted.append((index, event))
-        if event.end <= event.start:
-            add("INVALID_TIME", f"'{planned.title}'의 종료 시각이 시작 시각보다 늦지 않습니다.", index)
-        if not plan.plan_start <= planned.date <= plan.plan_end or event.end.date() > plan.plan_end + timedelta(days=1):
-            add("OUTSIDE_PLAN", f"'{planned.title}'이 계획 기간 밖에 있습니다.", index)
-
-        goal = goal_map.get(planned.goal)
-        if goal is None:
-            add("UNKNOWN_GOAL", f"'{planned.goal}'은 PlanSpec에 없는 목표입니다.", index)
-            continue
-        if goal.deadline and planned.date > goal.deadline:
-            add("AFTER_DEADLINE", f"'{planned.goal}' 일정이 마감일 이후에 있습니다.", index)
-        if goal.recurrence == "weekdays" and planned.date.weekday() >= 5:
-            add("RECURRENCE_DAY", f"'{planned.goal}'은 평일 목표이지만 주말에 배치됐습니다.", index)
-        if goal.recurrence == "weekends" and planned.date.weekday() < 5:
-            add("RECURRENCE_DAY", f"'{planned.goal}'은 주말 목표이지만 평일에 배치됐습니다.", index)
-
-        duration = int((event.end - event.start).total_seconds() // 60)
-        if goal.recurrence != "flexible" and goal.session_minutes:
-            tolerance = max(10, round(goal.session_minutes * 0.2))
-            if abs(duration - goal.session_minutes) > tolerance:
-                add("SESSION_DURATION", f"'{planned.goal}'의 회당 시간이 {goal.session_minutes}분과 크게 다릅니다.", index)
-        if not _within_active_hours(event, plan.lifestyle):
-            add("USER_TIME_CONSTRAINT", f"'{planned.title}'이 사용자의 활동 가능 시간을 벗어났습니다.", index)
-        if any(event.start < block_end and event.end > block_start for block_start, block_end in _explicit_unavailable_blocks(planned.date, plan.lifestyle)):
-            add("USER_TIME_CONSTRAINT", f"'{planned.title}'이 사용자가 명시한 생활 시간과 겹칩니다.", index)
-        if any(_overlaps(event, fixed) for fixed in fixed_events):
-            add("FIXED_OVERLAP", f"'{planned.title}'이 고정 일정과 겹칩니다.", index)
-
-        event_start = event.start.hour * 60 + event.start.minute
-        event_end = event.end.hour * 60 + event.end.minute
-        if event.end.date() > event.start.date():
-            event_end += 24 * 60
-        for rule in plan.availability_rules:
-            if not _availability_applies(planned.date, rule.recurrence):
-                continue
-            label = {"daily": "매일", "weekdays": "평일", "weekends": "주말"}[rule.recurrence]
-            if rule.start_time and event_start < _clock_minutes(rule.start_time):
-                add("AVAILABILITY_TIME", f"'{planned.title}'이 {label} 가능 시작 시각 {rule.start_time} 이전에 배치됐습니다.", index)
-            if rule.end_time and event_end > _clock_minutes(rule.end_time):
-                add("AVAILABILITY_TIME", f"'{planned.title}'이 {label} 가능 종료 시각 {rule.end_time} 이후에 배치됐습니다.", index)
+    if event.end <= event.start:
+        add("INVALID_TIME", f"'{event.title}'의 종료 시각이 시작 시각보다 늦지 않습니다.")
+        return issues  # 음수 길이를 이후 일일 합계에 더하지 않는다.
+    if not plan.plan_start <= event.start.date() <= plan.plan_end:
+        add("OUTSIDE_PLAN", f"'{event.title}'이 계획 기간 밖에 있습니다.")
+    if goal is None:
+        add("UNKNOWN_GOAL", f"'{event.goal}'은 PlanSpec에 없는 목표입니다.")
+        return issues
+    if goal.deadline and event.start.date() > goal.deadline:
+        add("AFTER_DEADLINE", f"'{event.goal}' 일정이 마감일 이후에 있습니다.")
+    if goal.recurrence in {"weekdays", "weekends"} and not _matches(event.start.date(), goal.recurrence):
+        add("RECURRENCE_DAY", f"'{event.goal}'이 {DAY_LABELS[goal.recurrence]} 반복 조건을 벗어났습니다.")
+    if goal.recurrence != "flexible" and goal.session_minutes:
+        # 반복 습관의 길이에만 허용 오차를 적용한다. flexible 세션은 강제하지 않는다.
+        tolerance = max(10, round(goal.session_minutes * 0.2))
+        if abs(_duration(event) - goal.session_minutes) > tolerance:
+            add("SESSION_DURATION", f"'{event.goal}'의 회당 시간이 {goal.session_minutes}분과 크게 다릅니다.")
+    if not _within_time_window(event, plan.lifestyle.active_start, plan.lifestyle.active_end):
+        add("USER_TIME_CONSTRAINT", f"'{event.title}'이 사용자의 활동 가능 시간을 벗어났습니다.")
+    # 자정을 넘는 생활 시간은 전날 시작한 구간과도 비교한다.
+    blocks = [block for day in (event.start.date() - timedelta(days=1), event.start.date())
+              for block in _explicit_unavailable_blocks(day, plan.lifestyle)]
+    if any(event.start < end and event.end > start for start, end in blocks):
+        add("USER_TIME_CONSTRAINT", f"'{event.title}'이 사용자가 명시한 생활 시간과 겹칩니다.")
+    if any(_overlaps(event, fixed) for fixed in fixed_events):
+        add("FIXED_OVERLAP", f"'{event.title}'이 고정 일정과 겹칩니다.")
 
     for rule in plan.availability_rules:
-        if rule.max_minutes_per_day is None:
+        if _matches(event.start.date(), rule.recurrence) and not _within_time_window(
+            event, rule.start_time, rule.end_time,
+        ):
+            label = DAY_LABELS[rule.recurrence]
+            add("AVAILABILITY_TIME", f"'{event.title}'이 {label} 가능 시간 {rule.start_time or '00:00'}~{rule.end_time or '24:00'}을 벗어났습니다.")
+    return issues
+
+
+# %% draft_validation
+def validate_draft(
+    plan: PlanSpec, draft: DraftSchedule,
+    fixed_events: list[CalendarEvent] | None = None,
+) -> ValidationResult:
+    """개별 일정 → 일정 간 충돌·하루 한도 → 반복 누락 순서로 검증한다."""
+    fixed_events = fixed_events if fixed_events is not None else _expand_fixed_schedules(plan)
+    goals = {goal.title: goal for goal in plan.goals}
+    events = [_convert_planned_event(event) for event in draft.events]
+    issues = []
+
+    # 1. 먼저 개별 일정의 명시적인 오류를 수집한다.
+    for index, event in enumerate(events):
+        issues.extend(_event_issues(index, event, plan, goals.get(event.goal), fixed_events))
+    invalid = {issue.event_index for issue in issues}
+
+    # 2. 제외된 일정은 다시 비교하거나 누적하지 않는다. 정상 일정을 연쇄 제외하지 않기 위함이다.
+    accepted: list[CalendarEvent] = []
+    daily_total: dict[date, int] = defaultdict(int)
+    for index in sorted(range(len(events)), key=lambda i: events[i].start):
+        if index in invalid:
             continue
-        daily_total: dict[date, int] = {}
-        for index, event in sorted(converted, key=lambda item: item[1].start):
-            day = event.start.date()
-            if not _availability_applies(day, rule.recurrence):
-                continue
-            duration = int((event.end - event.start).total_seconds() // 60)
-            daily_total[day] = daily_total.get(day, 0) + duration
-            if daily_total[day] > rule.max_minutes_per_day:
-                label = {"daily": "매일", "weekdays": "평일", "weekends": "주말"}[rule.recurrence]
-                add(
-                    "DAILY_LIMIT_EXCEEDED",
-                    f"{day.isoformat()} {label} generated 일정이 하루 최대 {rule.max_minutes_per_day}분을 초과했습니다. (총 {daily_total[day]}분)",
-                    index,
-                )
+        event = events[index]
+        previous = next((other for other in accepted if _overlaps(event, other)), None)
+        if previous is not None:
+            issues.append(ValidationIssue(
+                code="GENERATED_OVERLAP", event_index=index,
+                message=f"'{previous.title}'과 '{event.title}'이 겹칩니다.",
+            ))
+            continue
+        day = event.start.date()
+        total = daily_total[day] + _duration(event)
+        limits = [rule.max_minutes_per_day for rule in plan.availability_rules
+                  if _matches(day, rule.recurrence) and rule.max_minutes_per_day is not None]
+        if limits and total > min(limits):
+            issues.append(ValidationIssue(
+                code="DAILY_LIMIT_EXCEEDED", event_index=index,
+                message=f"{day.isoformat()} 생성 일정이 하루 최대 {min(limits)}분을 초과했습니다. (합산 {total}분)",
+            ))
+            continue
+        accepted.append(event)
+        daily_total[day] = total
 
-    valid_for_overlap = [(index, event) for index, event in converted if index not in invalid_indices]
-    valid_for_overlap.sort(key=lambda item: item[1].start)
-    for position, (index, event) in enumerate(valid_for_overlap):
-        for _, previous in valid_for_overlap[:position]:
-            if _overlaps(event, previous):
-                add("GENERATED_OVERLAP", f"'{previous.title}'과 '{event.title}'이 겹칩니다.", index)
-                break
-
-    valid_dates_by_goal: dict[str, set[date]] = {}
-    for index, event in converted:
-        if index not in invalid_indices and event.goal:
-            valid_dates_by_goal.setdefault(event.goal, set()).add(event.start.date())
-
+    # 3. 실제로 남은 일정의 날짜를 기준으로 daily/평일/주말 누락을 찾는다.
     for goal in plan.goals:
         if goal.recurrence not in {"daily", "weekdays", "weekends"}:
             continue
-        missing = sorted(set(_expected_dates(goal, plan)) - valid_dates_by_goal.get(goal.title, set()))
+        actual_dates = {event.start.date() for event in accepted if event.goal == goal.title}
+        missing = sorted(set(_expected_dates(goal, plan)) - actual_dates)
         if missing:
             dates = ", ".join(day.strftime("%m-%d") for day in missing)
-            add("RECURRENCE_MISSING", f"'{goal.title}' 반복 일정이 누락된 날짜: {dates}")
-
+            issues.append(ValidationIssue(
+                code="RECURRENCE_MISSING",
+                message=f"'{goal.title}' 반복 일정이 누락된 날짜: {dates}",
+            ))
     return ValidationResult(valid=not issues, issues=issues)
 
 
-def _valid_generated_events(draft: DraftSchedule, validation: ValidationResult) -> list[CalendarEvent]:
-    invalid_indices = {issue.event_index for issue in validation.issues if issue.event_index is not None}
-    events = [_convert_planned_event(event) for index, event in enumerate(draft.events) if index not in invalid_indices]
-    return sorted(events, key=lambda event: event.start)
-
-
+# %% result_building
 def _required_minutes(goal: ParsedGoal, plan: PlanSpec) -> int | None:
     if goal.required_minutes is not None:
         return goal.required_minutes
@@ -488,54 +518,59 @@ def _required_minutes(goal: ParsedGoal, plan: PlanSpec) -> int | None:
     return None
 
 
-def _build_schedule_result(plan: PlanSpec, draft: DraftSchedule, validation: ValidationResult, fixed_events: list[CalendarEvent]) -> ScheduleResult:
-    generated_events = _valid_generated_events(draft, validation)
-    events = sorted(fixed_events + generated_events, key=lambda event: event.start)
-    warnings = list(draft.warnings)
-    if not validation.valid:
-        warnings.extend(f"자동 수정 후 미해결: {issue.message}" for issue in validation.issues)
+def _build_schedule_result(
+    plan: PlanSpec, draft: DraftSchedule, validation: ValidationResult,
+    fixed_events: list[CalendarEvent],
+) -> ScheduleResult:
+    """위반 이벤트만 제외하고, 실제 남은 이벤트로 시간과 부족량을 집계한다."""
+    invalid = {issue.event_index for issue in validation.issues if issue.event_index is not None}
+    generated = [_convert_planned_event(event) for i, event in enumerate(draft.events) if i not in invalid]
+    allocated: dict[str, int] = defaultdict(int)
+    for event in generated:
+        allocated[event.goal] += _duration(event)
 
-    priority_order = {"high": 0, "medium": 1, "low": 2}
-    summaries: list[GoalSummary] = []
+    # 해석 가정은 plan_spec.warnings에 유지하고 최종 주의사항과 섞지 않는다.
+    warnings = list(draft.warnings) + [f"미해결: {issue.message}" for issue in validation.issues]
+    summaries = []
     for goal in plan.goals:
-        allocated_minutes = sum(int((event.end - event.start).total_seconds() // 60) for event in generated_events if event.goal == goal.title)
-        required_minutes = _required_minutes(goal, plan)
-        shortage_minutes = max(required_minutes - allocated_minutes, 0) if required_minutes is not None else 0
-        if shortage_minutes:
-            warnings.append(f"'{goal.title}'은 {shortage_minutes / 60:g}시간이 부족합니다.")
+        required = _required_minutes(goal, plan)
+        shortage = max(required - allocated[goal.title], 0) if required is not None else 0
+        if shortage:
+            warnings.append(f"'{goal.title}'은 {shortage / 60:g}시간이 부족합니다.")
         summaries.append(GoalSummary(
-            title=goal.title,
-            priority=goal.priority,
-            priority_reason=goal.priority_reason,
-            deadline=goal.deadline,
-            required_hours=round(required_minutes / 60, 2) if required_minutes is not None else None,
-            allocated_hours=round(allocated_minutes / 60, 2),
-            shortage_hours=round(shortage_minutes / 60, 2),
+            title=goal.title, priority=goal.priority,
+            priority_reason=goal.priority_reason, deadline=goal.deadline,
+            required_hours=round(required / 60, 2) if required is not None else None,
+            allocated_hours=round(allocated[goal.title] / 60, 2),
+            shortage_hours=round(shortage / 60, 2),
         ))
-
     return ScheduleResult(
-        plan_start=plan.plan_start,
-        plan_end=plan.plan_end,
-        events=events,
-        goals=sorted(summaries, key=lambda goal: priority_order[goal.priority]),
-        plan_spec=plan,
-        strategy_summary=draft.strategy_summary,
+        plan_start=plan.plan_start, plan_end=plan.plan_end,
+        events=sorted(fixed_events + generated, key=lambda event: event.start),
+        goals=sorted(summaries, key=lambda goal: PRIORITY_ORDER[goal.priority]),
+        plan_spec=plan, strategy_summary=draft.strategy_summary,
         warning=" ".join(dict.fromkeys(warnings)) or None,
     )
 
 
-RepairFunction = Callable[[PlanSpec, list[CalendarEvent], DraftSchedule, ValidationResult], DraftSchedule]
-
-
-def process_draft(plan: PlanSpec, draft: DraftSchedule, repair: RepairFunction | None = None) -> ScheduleResult:
+# %% chains
+def process_draft(
+    plan: PlanSpec, draft: DraftSchedule,
+    repair: Callable[[dict[str, str]], DraftSchedule] | None = None,
+    *, fixed_events: list[CalendarEvent] | None = None,
+) -> ScheduleResult:
+    """항상 검증하고, 필요한 경우에만 Repair를 한 번 실행한다."""
     plan = _normalize_plan_period(plan)
-    fixed_events = _expand_fixed_schedules(plan)
-    validation = validate_draft(plan, draft, fixed_events)
-    final_draft = draft
+    fixed = fixed_events if fixed_events is not None else _expand_fixed_schedules(plan)
+    validation = validate_draft(plan, draft, fixed)
     if not validation.valid and repair is not None:
-        final_draft = repair(plan, fixed_events, draft, validation)
-        validation = validate_draft(plan, final_draft, fixed_events)
-    return _build_schedule_result(plan, final_draft, validation, fixed_events)
+        # 검증 오류와 기존 초안을 수정 체인의 입력으로 전달한다.
+        draft = repair({
+            "plan_spec_json": _json(plan), "fixed_events_json": _json(fixed),
+            "draft_json": _json(draft), "issues_json": _json(validation.issues),
+        })
+        validation = validate_draft(plan, draft, fixed)
+    return _build_schedule_result(plan, draft, validation, fixed)
 
 
 def _json(value: BaseModel | list[BaseModel]) -> str:
@@ -544,117 +579,144 @@ def _json(value: BaseModel | list[BaseModel]) -> str:
 
 
 def build_chain():
-    llm = _model()
+    """형식이 다른 세 LLM 체인을 만들고, Python 분기 처리를 LCEL에 연결한다."""
+    provider, model_name, _ = model_settings()
+    llm = init_chat_model(model_name, model_provider=provider, temperature=0)
+
+    # 실습과 같은 Prompt | Model 구조이며, 각 단계의 출력 스키마만 다르다.
     interpret_chain = INTERPRET_PROMPT | llm.with_structured_output(PlanSpec)
     planner_chain = PLAN_PROMPT | llm.with_structured_output(DraftSchedule)
     repair_chain = REPAIR_PROMPT | llm.with_structured_output(DraftSchedule)
 
     def plan_validate_repair(plan: PlanSpec) -> ScheduleResult:
         plan = _normalize_plan_period(plan)
-        fixed_events = _expand_fixed_schedules(plan)
-        draft = planner_chain.invoke({"plan_spec_json": _json(plan), "fixed_events_json": _json(fixed_events)})
+        fixed = _expand_fixed_schedules(plan)
+        context = {"plan_spec_json": _json(plan), "fixed_events_json": _json(fixed)}
+        draft = planner_chain.invoke(context)
 
-        def repair(current_plan: PlanSpec, current_fixed: list[CalendarEvent], current_draft: DraftSchedule, validation: ValidationResult) -> DraftSchedule:
-            return repair_chain.invoke({
-                "plan_spec_json": _json(current_plan),
-                "fixed_events_json": _json(current_fixed),
-                "draft_json": _json(current_draft),
-                "issues_json": _json(validation.issues),
-            })
-
-        return process_draft(plan, draft, repair)
+        return process_draft(plan, draft, repair_chain.invoke, fixed_events=fixed)
 
     return interpret_chain | RunnableLambda(plan_validate_repair)
 
 
-def is_mock_mode() -> bool:
-    provider = os.getenv("MODEL_PROVIDER", "google_genai")
-    if provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY", "")
-    elif provider == "google_genai":
-        api_key = os.getenv("GOOGLE_API_KEY", "")
-    else:
-        return True
-    return not api_key or api_key == "fake-key"
-
-
+# %% mock_plan
 def _mock_interpretation(user_input: str, today: date) -> PlanSpec:
-    october_fifth = date(today.year, 10, 5)
-    has_exam_date = "10월 초" in user_input and today <= october_fifth
-    plan_end = october_fifth if has_exam_date else today + timedelta(days=13)
-    warnings = [f"'10월 초'를 {october_fifth.isoformat()}로 해석했습니다."] if has_exam_date else []
-    availability_rules: list[AvailabilityRule] = []
+    """두 시연 사례의 고정 데이터다. 임의 자연어를 해석하는 모델이 아니다."""
+    if "발표" in user_input:
+        deadline = today + timedelta(days=7 - today.weekday() + 4)
+        return PlanSpec(
+            plan_start=today, plan_end=deadline,
+            goals=[
+                ParsedGoal(title="발표 자료 제작", deadline=deadline, priority="high",
+                           priority_reason="마감 전에 제작 완료 필요", session_minutes=120, required_minutes=360),
+                ParsedGoal(title="발표 연습", deadline=deadline, priority="medium",
+                           priority_reason="자료 완성 후 반복 연습 필요", session_minutes=60, required_minutes=180),
+            ],
+            fixed_schedules=[FixedSchedule(
+                title="약속", recurrence="once", start_time="19:00", end_time="21:00",
+                event_date=today + timedelta(days=(1 - today.weekday()) % 7),
+            )],
+            availability_rules=[AvailabilityRule(recurrence="weekends", preference="preferred")],
+            constraints=["한 번에 너무 오래 하지 않기"],
+        )
+
+    exam = date(today.year, 10, 5)
+    has_exam = "10월 초" in user_input and today <= exam
+    end = min(exam if has_exam else today + timedelta(days=13), today + timedelta(days=27))
+    plan = PlanSpec(plan_start=today, plan_end=end, goals=[])
+    if has_exam:
+        plan.warnings.append(f"'10월 초'를 {exam.isoformat()}로 해석했습니다.")
+    if "부트캠프" in user_input:
+        plan.fixed_schedules.append(FixedSchedule(
+            title="부트캠프", recurrence="weekdays", start_time="09:00", end_time="18:00",
+        ))
     if "평일 저녁" in user_input:
-        max_minutes = 120 if "2시간" in user_input else None
-        availability_rules.append(AvailabilityRule(recurrence="weekdays", start_time="18:00", max_minutes_per_day=max_minutes))
-        warnings.append("'평일 저녁'의 시작 시각을 18:00으로 해석했습니다.")
-    if "주말" in user_input and ("여유" in user_input or "여유로워" in user_input):
-        availability_rules.append(AvailabilityRule(recurrence="weekends", preference="preferred"))
-    fixed_schedules = [FixedSchedule(title="부트캠프", recurrence="weekdays", start_time="09:00", end_time="18:00")] if "부트캠프" in user_input else []
-    goals: list[ParsedGoal] = []
-    if "한국사" in user_input:
-        goals.append(ParsedGoal(title="한국사 시험", deadline=october_fifth if has_exam_date else plan_end, priority="high", priority_reason="시험일이 가까워 집중 학습이 필요함", recurrence="flexible", session_minutes=90, target_sessions_per_week=4, required_minutes=720))
-    if "SKCT" in user_input:
-        goals.append(ParsedGoal(title="SKCT 준비", deadline=plan_end, priority="high", priority_reason="채용 전형 준비가 필요함", recurrence="flexible", session_minutes=90, target_sessions_per_week=3, required_minutes=540))
+        plan.availability_rules.append(AvailabilityRule(
+            recurrence="weekdays", start_time="18:00",
+            max_minutes_per_day=120 if "2시간" in user_input else None,
+        ))
+        plan.warnings.append("'평일 저녁'의 시작 시각을 18:00으로 해석했습니다.")
+    if "주말" in user_input and "여유" in user_input:
+        plan.availability_rules.append(AvailabilityRule(recurrence="weekends", preference="preferred"))
+
+    samples = [
+        ("한국사", "한국사 시험", 720, 4, "시험일이 가까워 집중 학습이 필요함"),
+        ("SKCT", "SKCT 준비", 540, 3, "채용 전형 준비가 필요함"),
+    ]
+    for keyword, title, minutes, sessions, reason in samples:
+        if keyword in user_input:
+            plan.goals.append(ParsedGoal(
+                title=title, deadline=exam if keyword == "한국사" and has_exam else end,
+                priority="high", priority_reason=reason, session_minutes=90,
+                target_sessions_per_week=sessions, required_minutes=minutes,
+            ))
     if "영단어" in user_input or "영어 단어" in user_input:
-        goals.append(ParsedGoal(title="영단어", priority="medium", priority_reason="매일 반복해야 누적 효과가 있는 학습", recurrence="daily", session_minutes=30 if "30분" in user_input else 20))
-    return PlanSpec(plan_start=today, plan_end=min(plan_end, today + timedelta(days=27)), goals=goals, fixed_schedules=fixed_schedules, availability_rules=availability_rules, warnings=warnings)
+        plan.goals.append(ParsedGoal(
+            title="영단어", priority="medium", priority_reason="매일 반복해야 누적 효과가 있는 학습",
+            recurrence="daily", session_minutes=20 if "20분" in user_input else 30,
+        ))
+    return plan
 
 
+# %% mock_draft
 def _mock_draft(plan: PlanSpec) -> DraftSchedule:
-    goal_titles = {goal.title for goal in plan.goals}
-    remaining_minutes = {
-        goal.title: goal.required_minutes
-        for goal in plan.goals
-        if goal.required_minutes is not None
-    }
-    events: list[PlannedEvent] = []
-    for offset in range((plan.plan_end - plan.plan_start).days + 1):
-        day = plan.plan_start + timedelta(days=offset)
+    """예시 시간표를 날짜별 초안으로 변환한다. 실제 모델은 호출하지 않는다."""
+    goals = {goal.title: goal for goal in plan.goals}
+    if "발표 자료 제작" in goals:
+        sessions = [
+            (2, "19:00", "21:00", "발표 자료 제작"),
+            (5, "10:00", "12:00", "발표 자료 제작"),
+            (6, "14:00", "16:00", "발표 자료 제작"),
+            (3, "19:00", "20:00", "발표 연습"),
+            (6, "10:00", "11:00", "발표 연습"),
+            (9, "19:00", "20:00", "발표 연습"),
+        ]
+        events = [PlannedEvent(
+            title=title, goal=title, date=plan.plan_start + timedelta(days=offset),
+            start_time=start, end_time=end, reason="평일은 짧게, 주말은 제작과 연습을 나누어 배치",
+        ) for offset, start, end, title in sessions
+            if plan.plan_start + timedelta(days=offset) <= plan.plan_end]
+        return DraftSchedule(events=events, strategy_summary=
+            "약속이 있는 화요일은 비우고, 주말에 발표 자료 제작을 길게 배치했습니다. 발표 연습은 제작 세션과 분리했습니다.")
+
+    remaining = {goal.title: goal.required_minutes for goal in plan.goals if goal.required_minutes is not None}
+    events = []
+    for day in _days(plan.plan_start, plan.plan_end):
         if day.weekday() < 5:
-            main_goal = "한국사 시험" if day.weekday() in {0, 2, 4} else "SKCT 준비"
-            if main_goal in goal_titles and remaining_minutes.get(main_goal, 90) >= 90:
-                events.append(PlannedEvent(title=main_goal, date=day, start_time="19:00", end_time="20:30", goal=main_goal, reason="부트캠프 이후 식사와 휴식 시간을 둔 저녁 집중 세션"))
-                if main_goal in remaining_minutes:
-                    remaining_minutes[main_goal] -= 90
-            if "영단어" in goal_titles:
-                events.append(PlannedEvent(title="영단어", date=day, start_time="21:00", end_time="21:30", goal="영단어", reason="주요 공부 후 유지하는 짧은 습관"))
+            main = "한국사 시험" if day.weekday() in {0, 2, 4} else "SKCT 준비"
+            slots = [(main, "19:00", 90), ("영단어", "21:00", None)]
         else:
-            if "한국사 시험" in goal_titles and remaining_minutes.get("한국사 시험", 90) >= 90:
-                events.append(PlannedEvent(title="한국사 시험", date=day, start_time="10:00", end_time="11:30", goal="한국사 시험", reason="주말 오전 집중 시간 활용"))
-                if "한국사 시험" in remaining_minutes:
-                    remaining_minutes["한국사 시험"] -= 90
-            if "SKCT 준비" in goal_titles and remaining_minutes.get("SKCT 준비", 90) >= 90:
-                events.append(PlannedEvent(title="SKCT 준비", date=day, start_time="14:00", end_time="15:30", goal="SKCT 준비", reason="주말 오후 집중 세션 활용"))
-                if "SKCT 준비" in remaining_minutes:
-                    remaining_minutes["SKCT 준비"] -= 90
-            if "영단어" in goal_titles:
-                events.append(PlannedEvent(title="영단어", date=day, start_time="20:00", end_time="20:30", goal="영단어", reason="주말에도 짧은 반복 습관 유지"))
-    return DraftSchedule(events=events, strategy_summary="평일에는 부트캠프 이후 주요 학습을 하나만 배치했습니다. 주말은 한국사와 SKCT 집중 세션에 활용했습니다. 영단어는 매일 짧게 유지했습니다.")
+            slots = [("한국사 시험", "10:00", 90), ("SKCT 준비", "14:00", 90), ("영단어", "20:00", None)]
+        for title, start_value, minutes in slots:
+            if title not in goals:
+                continue
+            minutes = minutes or goals[title].session_minutes or 30
+            if remaining.get(title, minutes) < minutes:
+                continue
+            start = datetime.combine(day, time.fromisoformat(start_value))
+            events.append(PlannedEvent(
+                title=title, goal=title, date=day, start_time=start_value,
+                end_time=(start + timedelta(minutes=minutes)).strftime("%H:%M"),
+                reason="API 없는 시연을 위한 예시 배치",
+            ))
+            if title in remaining:
+                remaining[title] -= minutes
+    return DraftSchedule(events=events, strategy_summary=
+        "평일에는 부트캠프 이후 주요 학습을 하나만 배치했습니다. 주말은 한국사와 SKCT 집중 세션에 활용했습니다. 영단어는 매일 짧게 유지했습니다.")
 
 
+# %% entry_point
 def generate_schedule(user_input: str, current_date: date | None = None) -> ScheduleResult:
+    """앱과 노트북이 공유하는 진입점. 실제 키가 있으면 LLM 체인을 실행한다."""
+    if not user_input.strip():
+        raise ValueError("목표와 일정을 입력해 주세요.")
     today = current_date or date.today()
-    inputs = {
+    if is_mock_mode():
+        plan = _normalize_plan_period(_mock_interpretation(user_input, today))
+        return process_draft(plan, _mock_draft(plan))
+    return build_chain().invoke({
         "current_date": f"{today.isoformat()} ({today.strftime('%A')})",
         "default_plan_end": (today + timedelta(days=13)).isoformat(),
         "max_plan_end": (today + timedelta(days=27)).isoformat(),
         "user_input": user_input,
-    }
-    if is_mock_mode():
-        plan = _normalize_plan_period(_mock_interpretation(user_input, today))
-        return process_draft(plan, _mock_draft(plan))
-    return build_chain().invoke(inputs)
-
-
-def to_calendar_events(result: ScheduleResult | None) -> list[dict]:
-    if result is None:
-        return []
-    colors = {"fixed": "#64748b", "generated": "#6d5dfc"}
-    return [{
-        "title": event.title,
-        "start": event.start.isoformat(),
-        "end": event.end.isoformat(),
-        "backgroundColor": colors[event.kind],
-        "borderColor": colors[event.kind],
-    } for event in result.events]
+    })
